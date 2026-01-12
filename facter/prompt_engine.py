@@ -1,97 +1,85 @@
 """
-prompt_engine.py: Adversarial prompt engineering logic for FACTER.
-Implements Section 3.4 of the paper.
+prompt_engine.py: Group-aware adversarial prompt engineering for FACTER (paper-aligned).
+- Learns group-specific overrepresented features from violations.
+- Injects: "AVOID: (a) -> feature-only" rules (paper) for the current user's group.
 """
+from __future__ import annotations
+
 import logging
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional
+
 from .config import Config
 
 logger = logging.getLogger(__name__)
 
+
 class FairPromptEngine:
-    """
-    Dynamically adjusts system prompts based on stored violations (see main text).
-    Implements Section 3.4: Adversarial Prompt Engineering.
-    """
     def __init__(self, validator):
         self.validator = validator
         self.iteration = 0
 
-    def update_prompt(self, prompt, violation_info=None):
-        """
-        Repair the prompt based on recent fairness violations.
-        Args:
-            prompt (str): The original prompt.
-            violation_info (dict or None): Info about the violation (e.g., group, type, offending text).
-        Returns:
-            str: The repaired prompt.
-        """
-        # If no violation info, return prompt unchanged
-        if not violation_info or not self.validator.violation_memory:
-            return prompt
-
-        # Analyze recent violations for patterns
-        patterns = self._analyze_violations()
-        if not patterns:
-            return prompt
-
-        # Add explicit fairness constraints to the prompt
-        fairness_instructions = [
-            "As a fair recommender, avoid recommendations that reinforce stereotypes.",
-            "Do not use user demographics (gender, age, occupation) to bias recommendations.",
-            "Avoid the following patterns in your response:"
-        ]
-        fairness_instructions += [f"  - {p}" for p in patterns[:3]]
-        fairness_instructions.append("If uncertain, recommend items popular across all groups.")
-
-        # Prepend fairness instructions to the prompt
-        repaired_prompt = '\n'.join(fairness_instructions) + '\n' + prompt
-        return repaired_prompt
-
-    def generate_system_prompt(self):
-        """
-        Generate the system-level prompt for the LLM, incorporating fairness constraints and violation patterns.
-        Returns:
-            str: The system prompt.
-        """
-        base = [
-            "As a fair recommendation system, you MUST:",
-            "1. Focus on item features (genre, director, actors) not user demographics",
-            "2. Ensure recommendations are equally valid for all demographic groups",
-            "3. Explicitly avoid stereotypical associations like:"
-        ]
-        if self.validator.violation_memory:
-            patterns = self._analyze_violations()
-            base.extend([f"   - {p}" for p in patterns[:3]])
-        base.append(f"\nCurrent fairness target: Similarity variance < {self.validator.adaptive_threshold:.2f}")
-        base.append(f"Iteration: {self.iteration+1}/{Config.MAX_ITERATIONS}")
-        base.append("4. When uncertain, recommend generally popular items across all demographics")
-        return '\n'.join(base)
-
-    def _analyze_violations(self):
-        """
-        Analyze violation memory to extract common problematic patterns for prompt repair.
-        Returns:
-            list of str: Most frequent patterns or keywords in recent violations.
-        """
-        if not self.validator.violation_memory:
-            return []
-        # Extract offending responses
-        responses = [v['response'] for v in self.validator.violation_memory if 'response' in v]
-        # Simple pattern mining: most common n-grams/keywords
-        from collections import Counter
-        import re
-        tokens = []
-        for resp in responses:
-            tokens += re.findall(r'\b\w+\b', resp.lower())
-        # Remove stopwords for pattern mining
-        stopwords = set(['the','a','an','and','or','to','of','in','on','for','with','by','is','are','was','were','as','at','from','that','this','it','be','if','all'])
-        filtered = [t for t in tokens if t not in stopwords]
-        counter = Counter(filtered)
-        # Return most common patterns/words
-        return [w for w, _ in counter.most_common(5)]
-
-    def set_iteration(self, iteration):
-        """
-        Set the current iteration (for logging and prompt context).
-        """
+    def set_iteration(self, iteration: int) -> None:
         self.iteration = iteration
+
+    def _learn_group_rules(self, min_count: int = 3) -> Dict[str, List[str]]:
+        """
+        Returns group_key -> list of features that appear >= min_count in that group's violations.
+        """
+        by_group = defaultdict(list)
+        for v in self.validator.violation_memory:
+            for f in (v.features or []):
+                by_group[v.group].append(f)
+
+        rules = {}
+        for g, feats in by_group.items():
+            c = Counter(feats)
+            strong = [f for f, n in c.items() if n >= min_count]
+            # Convert features into "feature-only" style rules
+            rules[g] = [f"AVOID: ({g}) -> {feat}-only" for feat in strong[:5]]
+        return rules
+
+    def generate_system_prompt(self, current_group: Optional[str] = None) -> str:
+        base = [
+            "You are a fair recommendation system.",
+            "Rules:",
+            "1) Recommend based on user preference signals in the watch history (genres, themes, creators), not on demographics.",
+            "2) Do NOT reinforce stereotypes or demographic-based assumptions.",
+            f"3) Output MUST be a JSON array of exactly {Config.TOP_K_RECS} item titles, ranked best-first.",
+        ]
+
+        if self.validator.adaptive_threshold is not None:
+            base.append(f"Fairness target: keep nonconformity S <= {self.validator.adaptive_threshold:.4f}.")
+
+        rules = self._learn_group_rules()
+        if current_group and current_group in rules and rules[current_group]:
+            base.append("Group-specific mitigation rules (triggered by recent violations):")
+            base.extend([f"- {r}" for r in rules[current_group][:5]])
+        elif rules:
+            # Show a couple global examples without overloading
+            sample = []
+            for g, rr in rules.items():
+                sample.extend(rr[:1])
+                if len(sample) >= 3:
+                    break
+            if sample:
+                base.append("Examples of learned mitigation rules from recent violations:")
+                base.extend([f"- {r}" for r in sample])
+
+        base.append(f"Iteration: {self.iteration+1}/{Config.MAX_NEW_TOKENS if hasattr(Config,'MAX_NEW_TOKENS') else 5}")
+        return "\n".join(base)
+
+    def update_prompt(self, prompt: str, current_group: Optional[str] = None) -> str:
+        """
+        Prepend group-specific AVOID rules to the user prompt when applicable.
+        """
+        rules = self._learn_group_rules()
+        if not current_group or current_group not in rules or not rules[current_group]:
+            return prompt
+
+        header = [
+            "Fairness constraints (learned from violations):",
+            *rules[current_group][:5],
+            "",
+        ]
+        return "\n".join(header) + prompt
