@@ -29,9 +29,8 @@ class Config:
     # -------------------------
     # Paper: Llama-3-8B-Instruct (the demo repo used 3.1 for convenience)
     LLM_BACKBONE: str = "meta-llama/Meta-Llama-3-8B-Instruct"
-    # Default embedder (fine-tuning mpnet)
-    EMBEDDER_NAME: str = "sentence-transformers/paraphrase-mpnet-base-v2"
-    # A public drop-in alternative fine-tuned for movie retrieval (optional)
+    # EMBEDDER_NAME: str = "sentence-transformers/paraphrase-mpnet-base-v2"
+    # A public drop-in alternative fine-tuned for movie retrieval (we used this)
     EMBEDDER_ALT_PUBLIC: str = "JJTsao/fine-tuned_movie_retriever-all-mpnet-base-v2"
 
     # -------------------------
