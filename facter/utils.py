@@ -1,177 +1,161 @@
 """
-utils.py: Utility functions for FACTER (logging, metrics, etc).
+utils.py: Generation, parsing, and metrics for FACTER (paper-aligned).
+- Generates Top-K ranked lists (open-vocabulary) and parses JSON arrays.
+- Computes HitRate@K and NDCG@K for next-item prediction.
 """
+from __future__ import annotations
+
+import json
 import logging
-import torch
-import numpy as np
-from sentence_transformers import util
+import re
 from difflib import SequenceMatcher
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+
 from .config import Config
 
+logger = logging.getLogger(__name__)
+
+
 def setup_logging():
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger(__name__)
-    return logger
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    return logging.getLogger(__name__)
 
-# LLM batch generation
 
-def generate_recommendations(prompts, system_msg, tokenizer, model):
+# -------------------------
+# Prompt formatting (chat template if available)
+# -------------------------
+def _format_chat(tokenizer, system_msg: str, user_msg: str) -> torch.Tensor:
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    if hasattr(tokenizer, "apply_chat_template"):
+        return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
+    # fallback
+    text = f"<system>\n{system_msg}\n</system>\n<user>\n{user_msg}\n</user>\n<assistant>\n"
+    return tokenizer(text, return_tensors="pt").input_ids
+
+
+def _best_fuzzy_match(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def parse_ranked_list(text: str, k: int) -> List[str]:
     """
-    Batch-generate recommendations with the LLM.
+    Parse a model output into a list of titles.
+    Prefers JSON array; otherwise parse numbered/bulleted lines.
     """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    responses = []
+    if not text:
+        return []
+
+    # try JSON array
+    m = re.search(r"\[[\s\S]*\]", text)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            if isinstance(arr, list):
+                arr = [str(x).strip() for x in arr if str(x).strip()]
+                # unique preserve order
+                seen, out = set(), []
+                for x in arr:
+                    if x not in seen:
+                        out.append(x)
+                        seen.add(x)
+                    if len(out) >= k:
+                        break
+                return out
+        except Exception:
+            pass
+
+    # fallback parse lines
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    out = []
+    for ln in lines:
+        ln = re.sub(r"^\s*[\-\*\d\.\)\:]+\s*", "", ln).strip()
+        if ln:
+            out.append(ln)
+        if len(out) >= k:
+            break
+
+    # unique preserve order
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq[:k]
+
+
+def generate_recommendations(
+    prompts: List[str],
+    system_msg: str,
+    tokenizer,
+    model,
+) -> List[List[str]]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    all_recs: List[List[str]] = []
+
     for i in range(0, len(prompts), Config.BATCH_SIZE):
-        batch = [p for p in prompts[i:i+Config.BATCH_SIZE] if p is not None]
+        batch = [p for p in prompts[i : i + Config.BATCH_SIZE] if p is not None]
         if not batch:
             continue
-        try:
-            formatted_prompts = [
-                f"<system>{system_msg}</system>\n<user>{prompt}</user>\n<assistant>"
-                for prompt in batch
-            ]
-            inputs = tokenizer(
-                formatted_prompts,
-                return_tensors='pt',
-                padding=True,
-                truncation=True,
-                max_length=Config.MAX_PROMPT_LENGTH
-            ).to(device)
+
+        # build batch input ids
+        input_ids_list = [_format_chat(tokenizer, system_msg, p) for p in batch]
+        # pad manually
+        max_len = max(x.shape[-1] for x in input_ids_list)
+        input_ids = torch.full((len(input_ids_list), max_len), tokenizer.pad_token_id, dtype=torch.long)
+        for j, x in enumerate(input_ids_list):
+            input_ids[j, -x.shape[-1] :] = x[0]
+        input_ids = input_ids.to(device)
+
+        with torch.no_grad():
             outputs = model.generate(
-                **inputs,
+                input_ids=input_ids,
                 max_new_tokens=Config.MAX_NEW_TOKENS,
-                temperature=0.7,
-                top_p=0.95,
-                repetition_penalty=1.5,
-                do_sample=True
+                temperature=Config.TEMPERATURE,
+                top_p=Config.TOP_P,
+                repetition_penalty=Config.REPETITION_PENALTY,
+                do_sample=True,
             )
-            batch_resp = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            responses.extend([parse_response(r) for r in batch_resp])
-        except Exception as e:
-            logging.error(f"Generation failed for batch {i}: {str(e)}")
-            responses.extend([""]*len(batch))
-    return responses
 
-def parse_response(response):
-    """
-    Extract the text after <assistant>, up to the first newline if present.
-    """
-    try:
-        return response.split("<assistant>")[-1].strip().split('\n')[0]
-    except:
-        return ""
+        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        for txt in decoded:
+            recs = parse_ranked_list(txt, Config.TOP_K_RECS)
+            all_recs.append(recs)
 
-def calculate_fairness_metrics(responses, protected_attributes, embedder, item_db):
-    """
-    Evaluate group disparities (SNSR, SNSV, CFR), overall violation score, 
-    and basic accuracy metrics (precision@k, recall@k).
-    See Section 4.3.
-    """
-    metrics = {'SNSR': 0, 'SNSV': 0, 'CFR': 0, 'ViolationScore': 0, 
-               'precision@k': 0, 'recall@k': 0}
-    try:
-        if responses.empty:
-            return metrics
-        # Group-level measures (SNSR, SNSV).
-        group_diffs = []
-        for attr in protected_attributes:
-            groups = responses[attr].unique()
-            if len(groups) < 2:
-                continue
-            group_embeddings = []
-            for g in groups:
-                subset = responses[responses[attr] == g]
-                if len(subset) < Config.MIN_GROUP_SIZE:
-                    continue
-                embs = embedder.encode(subset['response'].tolist())
-                group_embeddings.append(torch.mean(torch.tensor(embs), dim=0))
-            if len(group_embeddings) >= 2:
-                dist_matrix = 1 - util.cos_sim(torch.stack(group_embeddings), 
-                                               torch.stack(group_embeddings))
-                np.fill_diagonal(dist_matrix.numpy(), np.nan)
-                group_diffs.append(torch.nanmean(dist_matrix).item())
-        if group_diffs:
-            metrics['SNSR'] = np.nanmax(group_diffs)
-            metrics['SNSV'] = np.nanmean(group_diffs)
-        # Counterfactual fairness ratio (CFR)
-        cf_scores = []
-        if len(responses) >= 2:
-            from sklearn.utils import resample
-            for _ in range(Config.N_BOOTSTRAP):
-                sample = responses.sample(2, replace=True)
-                same_group = all(
-                    sample.iloc[0][attr] == sample.iloc[1][attr] 
-                    for attr in protected_attributes
-                )
-                if same_group:
-                    continue
-                sim = util.cos_sim(
-                    embedder.encode(sample.iloc[0]['response']),
-                    embedder.encode(sample.iloc[1]['response'])
-                ).item()
-                cf_scores.append(1 - sim)
-        metrics['CFR'] = np.mean(cf_scores) if cf_scores else 0
-        # Basic accuracy checks (precision@k, recall@k).
-        def parse_title(r):
-            return r.split("(")[0].strip()
-        responses['predicted'] = responses['response'].apply(parse_title)
-        def is_correct(row):
-            mid = row['mid']
-            item_info = item_db.get(mid, None)
-            if isinstance(item_info, dict) and 'title' in item_info:
-                pred = row['predicted'].lower()
-                gold = item_info['title'].lower()
-                ratio = SequenceMatcher(None, pred, gold).ratio()
-                return ratio > 0.8
-            return False
-        responses['correct'] = responses.apply(is_correct, axis=1)
-        metrics['precision@k'] = responses['correct'].mean()
-        metrics['recall@k'] = responses['correct'].sum() / len(responses)
-        # ViolationScore: fraction of extremely short/empty answers
-        valid_responses = [r for r in responses['response'] if len(r) > 10]
-        metrics['ViolationScore'] = 1 - (len(valid_responses)/len(responses)) if not responses.empty else 0
-    except Exception as e:
-        logging.error(f"Metric calculation failed: {str(e)}")
-    return metrics
+    # if any prompts were None, keep alignment by returning empty lists for them
+    if len(all_recs) != len(prompts):
+        # best-effort: pad
+        while len(all_recs) < len(prompts):
+            all_recs.append([])
+        all_recs = all_recs[: len(prompts)]
+    return all_recs
 
-def run_baselines(test_data, embedder, tokenizer, model, item_db):
-    """
-    Compares our framework with simplified UP5-like approach 
-    and a zero-shot LLM ranker (see Section 4.4).
-    """
-    def up5_method(data, item_db):
-        item_counts = data['mid'].value_counts()
-        popular_items = item_counts[item_counts > 100].index.tolist()
-        if not popular_items:
-            popular_items = item_counts.index.tolist()
-        selected_mids = np.random.choice(popular_items, size=len(data))
-        selected_titles = []
-        for mid in selected_mids:
-            item_info = item_db.get(mid, {})
-            title = item_info.get('title', 'Unknown Title')
-            selected_titles.append(title)
-        return selected_titles
-    def zero_shot_rank(prompts):
-        return generate_recommendations(prompts, "", tokenizer, model)
-    metrics = {}
-    test_data['up5_response'] = up5_method(test_data, item_db)
-    up5_metrics = calculate_fairness_metrics(
-        test_data.rename(columns={'up5_response': 'response'}),
-        Config.PROTECTED_ATTRIBUTES,
-        embedder,
-        item_db
-    )
-    metrics['UP5'] = up5_metrics
-    zs_responses = zero_shot_rank(test_data['prompt'].tolist())
-    test_data['zs_response'] = zs_responses
-    zs_metrics = calculate_fairness_metrics(
-        test_data.rename(columns={'zs_response': 'response'}),
-        Config.PROTECTED_ATTRIBUTES,
-        embedder,
-        item_db
-    )
-    metrics['ZeroShotLLM'] = zs_metrics
-    return metrics
 
-# Add more utility functions as needed
+# -------------------------
+# Metrics (@K)
+# -------------------------
+def hitrate_ndcg_at_k(preds: List[str], gold: str, k: int) -> Tuple[float, float]:
+    if not preds:
+        return 0.0, 0.0
+    gold = gold.strip()
+    for rank, p in enumerate(preds[:k], start=1):
+        if _best_fuzzy_match(p, gold) >= 0.85:
+            # Hit@K = 1; NDCG@K = 1/log2(rank+1)
+            return 1.0, 1.0 / np.log2(rank + 1)
+    return 0.0, 0.0
+
+
+def evaluate_at_k(df, k: int = 10) -> dict:
+    hits, ndcgs = [], []
+    for _, row in df.iterrows():
+        preds = row["recs"] if isinstance(row["recs"], list) else []
+        gold = str(row["target_title"])
+        h, n = hitrate_ndcg_at_k(preds, gold, k)
+        hits.append(h)
+        ndcgs.append(n)
+    return {
+        f"HitRate@{k}": float(np.mean(hits)) if hits else 0.0,
+        f"NDCG@{k}": float(np.mean(ndcgs)) if ndcgs else 0.0,
+    }
