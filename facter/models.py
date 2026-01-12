@@ -13,9 +13,9 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 
-def load_embedder(prefer_public_finetuned: bool = False):
+def load_embedder(prefer_public_finetuned: bool = True):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    name = Config.EMBEDDER_ALT_PUBLIC if prefer_public_finetuned else Config.EMBEDDER_NAME
+    name = Config.EMBEDDER_ALT_PUBLIC if prefer_public_finetuned
     logger.info(f"Loading embedder: {name}")
     return SentenceTransformer(name).to(device)
 
