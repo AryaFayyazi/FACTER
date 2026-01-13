@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -159,3 +159,38 @@ def evaluate_at_k(df, k: int = 10) -> dict:
         f"HitRate@{k}": float(np.mean(hits)) if hits else 0.0,
         f"NDCG@{k}": float(np.mean(ndcgs)) if ndcgs else 0.0,
     }
+
+def _best_fuzzy_match(a: str, b: str) -> float:
+    return SequenceMatcher(None, (a or "").lower().strip(), (b or "").lower().strip()).ratio()
+
+
+def hitrate_ndcg_at_k(preds: List[str], gold: str, k: int) -> Tuple[float, float]:
+    if not preds:
+        return 0.0, 0.0
+    gold = (gold or "").strip()
+    for rank, p in enumerate(preds[:k], start=1):
+        if p and _best_fuzzy_match(p, gold) >= 0.85:
+            return 1.0, 1.0 / np.log2(rank + 1)
+    return 0.0, 0.0
+
+
+def evaluate_at_k_from_lists(
+    rec_lists: List[List[str]],
+    gold_titles: List[str],
+    k: int = 10,
+) -> Dict[str, float]:
+    hits, ndcgs = [], []
+    for recs, gold in zip(rec_lists, gold_titles):
+        recs = recs if isinstance(recs, list) else []
+        h, n = hitrate_ndcg_at_k(recs, str(gold), k)
+        hits.append(h)
+        ndcgs.append(n)
+    return {
+        f"HitRate@{k}": float(np.mean(hits)) if hits else 0.0,
+        f"NDCG@{k}": float(np.mean(ndcgs)) if ndcgs else 0.0,
+    }
+
+
+def evaluate_valid_at_k(valid_at_k_list: List[float], k: int = 10) -> Dict[str, float]:
+    # valid_at_k_list is already per-example fraction valid among top-k mapped
+    return {f"Valid@{k}": float(np.mean(valid_at_k_list)) if valid_at_k_list else 0.0}
