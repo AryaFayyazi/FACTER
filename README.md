@@ -1,6 +1,6 @@
 # FACTER: Fairness-Aware Conformal Thresholding and Prompt EngineeRing
 
-This repository contains the official implementation for the ICML paper:
+This repository contains the official implementation for the ICML paper (The main branch is the simplified version of the code that is usefull for a demo. For the full implementation of the paper, please check the Fina_Version branch):
 
 **"Fairness-Aware Conformal Thresholding and Prompt EngineeRing (FACTER)"**
 
