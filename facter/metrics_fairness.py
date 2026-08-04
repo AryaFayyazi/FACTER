@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 from sentence_transformers import util
 
-from .catalog_map import rewrite_prompt_attrs
+from .catalog_map import rewrite_prompt_attrs, strip_prompt_attrs
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -129,15 +129,34 @@ def compute_cfr(
     df: pd.DataFrame,
     embedder,
     generate_fn: Callable[[List[str], str], List[List[str]]],
-    system_msg_neutral: str,
+    system_msg_neutral: str = "",
     *,
     k: int = 10,
     n_samples: int = 200,
     flip_mode: str = "tuple",   # "tuple" or single attribute name e.g. "gender"
     attr_value_sampler: Optional[Callable[[str, pd.DataFrame], str]] = None,
-    recs_distance: str = "pooled_cos",  # "pooled_cos" or "set_cos"
+    recs_distance: Optional[str] = None,  # "l2" (Eq. 14) | "pooled_cos" | "set_cos"
     prompt_col: str = "prompt",
+    system_msg: Optional[str] = None,
+    prompt_transform: Optional[Callable[[str, Dict[str, str]], str]] = None,
 ) -> CFRMetrics:
+    """Counterfactual Fairness Ratio.
+
+    IMPORTANT (measurement correctness).  Earlier releases always generated both
+    arms with the *neutral* system prompt and the *unmodified* user prompt, for
+    every method.  Under that setup FACTER's repaired prompt never entered the
+    measurement at all, so CFR could not differ between the zero-shot baseline
+    and FACTER by anything other than sampling noise -- which is what an external
+    reproduction observed.  CFR must be measured under whatever prompt the method
+    being evaluated would actually deploy.
+
+    ``system_msg``       system prompt of the method under evaluation
+                         (falls back to ``system_msg_neutral`` for the baseline).
+    ``prompt_transform`` optional ``(prompt, attrs) -> prompt`` hook applying the
+                         method's user-prompt repair.  It is applied to the
+                         counterfactual arm using the *counterfactual* group, so
+                         the intervention is evaluated as it would be served.
+    """
     """
     CFR proxy via counterfactual attribute flip on the SAME context:
     - sample examples
@@ -202,8 +221,15 @@ def compute_cfr(
 
         cf_prompt = rewrite_prompt_attrs(base_prompt, cf_attrs)
 
-        # Generate for both
-        recs_pair = generate_fn([base_prompt, cf_prompt], system_msg_neutral)
+        # Apply the evaluated method's prompt repair to each arm under its own
+        # group, so the intervention is measured as it would be deployed.
+        a_prompt, b_prompt = base_prompt, cf_prompt
+        if prompt_transform is not None:
+            a_prompt = prompt_transform(base_prompt, base_attrs)
+            b_prompt = prompt_transform(cf_prompt, cf_attrs)
+
+        sys_msg = system_msg if system_msg is not None else system_msg_neutral
+        recs_pair = generate_fn([a_prompt, b_prompt], sys_msg)
         if not (isinstance(recs_pair, list) and len(recs_pair) == 2):
             continue
         recs_a, recs_b = recs_pair[0], recs_pair[1]
@@ -214,11 +240,20 @@ def compute_cfr(
             continue
 
         # compute distance
-        if recs_distance == "pooled_cos":
+        mode = recs_distance or getattr(Config, "CFR_DISTANCE", "l2")
+        if mode == "l2":
+            # Eq. 14: CFR = E[ || f(x) - f(x_not_s) ||_2 ].  The paper states an
+            # L2 norm; earlier code used cosine distance, a different scale.
+            va = _pool_recs_embedding(embedder, recs_a)
+            vb = _pool_recs_embedding(embedder, recs_b)
+            va = va / (torch.norm(va) + 1e-12)
+            vb = vb / (torch.norm(vb) + 1e-12)
+            dist = float(torch.norm(va - vb, p=2).item())
+        elif mode == "pooled_cos":
             va = _pool_recs_embedding(embedder, recs_a)
             vb = _pool_recs_embedding(embedder, recs_b)
             dist = _cosine_distance(va, vb)
-        elif recs_distance == "set_cos":
+        elif mode == "set_cos":
             # mean rank-wise cosine distance (top-k aligned)
             m = min(len(recs_a), len(recs_b), k)
             if m == 0:
@@ -228,7 +263,7 @@ def compute_cfr(
             # 1 - cos for each rank
             dist = float(torch.mean(1.0 - torch.diag(util.cos_sim(Ea, Eb))).item())
         else:
-            raise ValueError("recs_distance must be 'pooled_cos' or 'set_cos'")
+            raise ValueError("recs_distance must be 'l2', 'pooled_cos' or 'set_cos'")
 
         cfr_vals.append(dist)
         valid_pairs += 1
@@ -236,3 +271,130 @@ def compute_cfr(
     CFR = float(np.mean(cfr_vals)) if cfr_vals else 0.0
     valid_rate = float(valid_pairs) / float(len(rows)) if len(rows) > 0 else 0.0
     return CFRMetrics(CFR=CFR, valid_rate=valid_rate, n_pairs=valid_pairs)
+
+
+# ---------------------------------------------------------------------------
+# SNSR / SNSV, as actually defined by FaiRLLM (Zhang et al., 2023)
+# ---------------------------------------------------------------------------
+@dataclass
+class SNSMetricsFairLLM:
+    SNSR: float                       # mean over attributes of max_a Sim(a) - min_a Sim(a)
+    SNSV: float                       # mean over attributes of std_a Sim(a)
+    per_attribute: Dict[str, Dict[str, float]]
+    n_users: int
+
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    A = {x for x in a if x}
+    B = {x for x in b if x}
+    if not A and not B:
+        return 1.0
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
+def compute_snsr_snsv_fairllm(
+    df: pd.DataFrame,
+    embedder,
+    generate_fn: Callable[[List[str], str], List[List[str]]],
+    *,
+    system_msg: str = "",
+    prompt_transform: Optional[Callable[[str, Dict[str, str]], str]] = None,
+    map_fn: Optional[Callable[[List[str]], List[str]]] = None,
+    attributes: Optional[List[str]] = None,
+    k: int = 10,
+    n_users: int = 60,
+    similarity: str = "jaccard",
+    prompt_col: str = "prompt",
+) -> SNSMetricsFairLLM:
+    """SNSR / SNSV per FaiRLLM (Zhang et al., 2023), the metric FACTER cites.
+
+        Sim_bar(a) = mean over users of Sim(R_neutral, R_a)
+        SNSR@K     = max_a Sim_bar(a) - min_a Sim_bar(a)
+        SNSV@K     = std_a Sim_bar(a)
+
+    ``R_neutral`` is generated from a prompt with the protected-attribute block
+    removed, and ``R_a`` from the same context with attribute value ``a``
+    injected.  Both are required by the definition.
+
+    This replaces an earlier implementation that computed pairwise cosine
+    distance between group-mean pooled embeddings.  That quantity never
+    referenced a neutral prompt, is not a range over attribute values, and is
+    not SNSR; it also cannot move much, because averaging recommendation
+    embeddings within a group washes out exactly the per-user differences the
+    metric is meant to expose.
+    """
+    if df is None or df.empty:
+        return SNSMetricsFairLLM(0.0, 0.0, {}, 0)
+
+    attributes = attributes or list(Config.PROTECTED_ATTRIBUTES)
+    rows = df.sample(n=min(n_users, len(df)), replace=False,
+                     random_state=Config.RANDOM_SEED)
+
+    def _mapped(recs: List[str]) -> List[str]:
+        recs = recs[:k] if isinstance(recs, list) else []
+        return map_fn(recs) if map_fn is not None else recs
+
+    # similarity accumulators: attr -> value -> [per-user similarity]
+    acc: Dict[str, Dict[str, List[float]]] = {a: {} for a in attributes}
+    values = {a: sorted(df[a].astype(str).unique().tolist()) for a in attributes}
+
+    for _, row in rows.iterrows():
+        base_prompt = row[prompt_col]
+        if not isinstance(base_prompt, str) or not base_prompt.strip():
+            continue
+        base_attrs = {a: str(row[a]) for a in Config.PROTECTED_ATTRIBUTES}
+
+        # build the neutral prompt and one prompt per (attribute, value)
+        neutral = strip_prompt_attrs(base_prompt)
+        variants: List[Tuple[str, str, str]] = []   # (attr, value, prompt)
+        for a in attributes:
+            for v in values[a]:
+                at = dict(base_attrs); at[a] = v
+                variants.append((a, v, rewrite_prompt_attrs(base_prompt, at)))
+
+        prompts = [neutral] + [p for _, _, p in variants]
+        attrs_for_transform = [base_attrs] + [
+            {**base_attrs, a: v} for a, v, _ in variants
+        ]
+        if prompt_transform is not None:
+            prompts = [prompt_transform(p, at)
+                       for p, at in zip(prompts, attrs_for_transform)]
+
+        outs = generate_fn(prompts, system_msg)
+        if not outs or len(outs) != len(prompts):
+            continue
+
+        r_neutral = _mapped(outs[0])
+        if similarity == "embedding":
+            v_neutral = _pool_recs_embedding(embedder, r_neutral)
+
+        for (a, v, _), out in zip(variants, outs[1:]):
+            r_a = _mapped(out)
+            if similarity == "jaccard":
+                sim = _jaccard(r_neutral, r_a)
+            elif similarity == "embedding":
+                sim = 1.0 - _cosine_distance(v_neutral,
+                                             _pool_recs_embedding(embedder, r_a))
+            else:
+                raise ValueError("similarity must be 'jaccard' or 'embedding'")
+            acc[a].setdefault(v, []).append(float(sim))
+
+    per_attr: Dict[str, Dict[str, float]] = {}
+    snsrs, snsvs = [], []
+    for a in attributes:
+        means = [float(np.mean(vals)) for vals in acc[a].values() if vals]
+        if len(means) < 2:
+            continue
+        snsr = float(np.max(means) - np.min(means))
+        snsv = float(np.std(means))
+        per_attr[a] = {"SNSR": snsr, "SNSV": snsv, "n_values": float(len(means))}
+        snsrs.append(snsr); snsvs.append(snsv)
+
+    return SNSMetricsFairLLM(
+        SNSR=float(np.mean(snsrs)) if snsrs else 0.0,
+        SNSV=float(np.mean(snsvs)) if snsvs else 0.0,
+        per_attribute=per_attr,
+        n_users=int(len(rows)),
+    )

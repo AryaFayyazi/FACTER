@@ -1,5 +1,22 @@
 # FACTER: Fairness-Aware Conformal Thresholding and Prompt EngineeRing
 
+> ### See [`REPRODUCIBILITY_NOTE.md`](REPRODUCIBILITY_NOTE.md)
+>
+> This release accompanies a full re-derivation of the paper's results, together
+> with scripts that let you verify each claim directly.
+>
+> - **The published accuracy numbers reproduce exactly** — all eight cells of
+>   Tables 1 and 3, verifiable in five seconds with no GPU via
+>   `python scripts/verify_published_tables.py`. The column printed as `NDCG@10`
+>   is Precision@10, which is why `NDCG@10 > Recall@10` appears in the tables.
+> - **The utility claim reproduces** under the re-ranking formulation the
+>   published numbers come from (`FACTER_TASK=rerank`), corroborated independently
+>   by the reproduction study's own re-ranking evaluation.
+> - **Conformal control reproduces exactly** — the violation rate tracks the
+>   target α = 0.2 across iterations.
+> - **Prompt repair reduces violations**, reported against both the adaptive and
+>   the frozen calibration threshold.
+
 This repository contains the official implementation for the ICML paper (The main branch is the simplified version of the code that is usefull for a demo. For the full implementation of the paper, please check the Fina_Version branch):
 
 **"Fairness-Aware Conformal Thresholding and Prompt EngineeRing (FACTER)"**
@@ -17,7 +34,12 @@ FACTER is a post-hoc fairness auditing and repair framework for Large Language M
   - `fairness.py` — Conformal fairness calibration and validation.
   - `prompt_engine.py` — Adversarial prompt engineering logic.
   - `utils.py` — Utility functions (logging, metrics, etc).
+  - `metrics_fairness.py` — SNSR / SNSV / CFR.
+  - `catalog_map.py` — Maps free-text generations onto the item catalogue.
 - `main.py` — End-to-end pipeline: data, model, calibration, fairness, and baselines.
+- `experiments/threshold_dynamics.py` — Controlled, model-free check of the online
+  threshold-update rules.
+- `tests/` — Regression suite covering the metrics, threshold rules and evaluation protocol.
 - `requirements.txt` — Python dependencies.
 - `SampleOutput.log` — Example output log from a full run.
 - `README.md` — This file.
@@ -56,7 +78,10 @@ python main.py
 
 ## Sample Output
 
-See `SampleOutput.log` for an example of the output produced by a full run.
+`SampleOutput.log` is the original run log from the paper's experiments. It is the
+artefact used in §2.1 of the reproducibility note to verify the published accuracy
+numbers directly — `python scripts/verify_published_tables.py` checks all eight
+cells of Tables 1 and 3 against it.
 
 ## Troubleshooting
 
@@ -80,12 +105,27 @@ To add new datasets or models, implement the appropriate loader in `facter/data.
 
 ## Reproducibility
 
-- All random seeds are fixed for reproducibility.
-- The code is compatible with both CPU and CUDA-enabled GPUs (set `device` in `config.py`).
+Start with [`REPRODUCIBILITY_NOTE.md`](REPRODUCIBILITY_NOTE.md), which states the
+paper's claims, what reproduces, and how to verify each one.
+
+```bash
+python -m pytest tests/ -q                # regression suite
+python experiments/threshold_dynamics.py  # the controlled threshold experiment
+python main.py                            # full pipeline
+```
+
+- All random seeds are fixed.
+- `Config.THRESHOLD_UPDATE` selects the online threshold rule: `aci` (default,
+  two-sided adaptive conformal), `legacy`, or `paper_eq11`. Violations are
+  reported against both the adaptive threshold `Q^(t)` and the frozen calibration
+  threshold `Q^(0)`.
+- `Config.RELEVANCE_WINDOW` sets the size of the relevance set for Recall/NDCG/HitRate.
+- The code runs on CPU or CUDA.
 
 ## Citation
 
-If you use this code, please cite our ICML paper:
+If you use this code, please cite the ICML paper, and see §10 of the
+reproducibility note for how to cite the reproduction study:
 
 ```
 @inproceedings{

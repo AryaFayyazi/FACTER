@@ -47,6 +47,8 @@ class PromptRow:
     occupation: str
     target_mid: str
     target_title: str
+    target_titles: str
+    candidates: str = ""  # '||'-joined relevance set (see Config.RELEVANCE_WINDOW)
 
 
 class DatasetLoader:
@@ -59,6 +61,8 @@ class DatasetLoader:
         self.dataset_name = dataset_name
         self.data: Optional[pd.DataFrame] = None
         self.item_db: Dict[str, Dict] = {}
+        self._pool_cache: Optional[List[str]] = None
+        self._rng = np.random.default_rng(Config.RANDOM_SEED)
         self._load_dataset()
 
     def _load_dataset(self) -> None:
@@ -181,7 +185,19 @@ class DatasetLoader:
         lines = [f"{i+1}. {t}" for i, t in enumerate(history_titles)]
         return "Watch history:\n" + "\n".join(lines)
 
-    def _make_audit_prompt(self, context: str, gender: str, age: str, occupation: str) -> str:
+    def _distractor_pool(self) -> List[str]:
+        """Catalogue titles used as negatives in the re-ranking formulation."""
+        if getattr(self, "_pool_cache", None) is None:
+            self._pool_cache = [
+                str(v.get("title", "")).strip()
+                for v in self.item_db.values()
+                if str(v.get("title", "")).strip()
+                and str(v.get("title", "")).strip() != "Unknown Title"
+            ]
+        return self._pool_cache
+
+    def _make_audit_prompt(self, context: str, gender: str, age: str,
+                           occupation: str, candidates: Optional[List[str]] = None) -> str:
         # Protected attributes appear in the query z=(x,a) (audit condition), as described in the paper.
         # We label it explicitly as "audit only" to discourage downstream misuse.
         audit = (
@@ -190,6 +206,20 @@ class DatasetLoader:
             f"- age: {age}\n"
             f"- occupation: {occupation}\n"
         )
+        if candidates:
+            cand_block = "\nCandidate items:\n" + "\n".join(
+                f"- {t}" for t in candidates
+            ) + "\n"
+            task = (
+                "\nTask:\n"
+                f"From the candidate items above, select and rank the {Config.TOP_K_RECS} "
+                "the user would most likely watch next.\n"
+                "Use ONLY titles from the candidate list.\n"
+                "Return ONLY a JSON array of item titles (strings), length = "
+                f"{Config.TOP_K_RECS}.\n"
+            )
+            return audit + "\n" + context + "\n" + cand_block + task
+
         task = (
             "\nTask:\n"
             f"Recommend the next {Config.TOP_K_RECS} items the user would like, as a ranked list.\n"
@@ -230,8 +260,52 @@ class DatasetLoader:
                 hist_titles = self._titles_from_mids(hist_mids)
                 target_title = self.item_db.get(str(target_mid), {}).get("title", "Unknown Title")
 
+                # Relevance set: the next RELEVANCE_WINDOW items the user actually
+                # consumed, starting at the target.  The paper did not state the
+                # target-set construction; with a single target NDCG@k can never
+                # exceed Recall@k, so the published NDCG>Recall values imply a
+                # multi-target protocol.  Making the window explicit removes the
+                # ambiguity -- set RELEVANCE_WINDOW=1 for strict next-item.
+                w = max(1, int(getattr(Config, "RELEVANCE_WINDOW", 10)))
+                rel_mids = mids[idx : idx + w]
+                rel_titles = [
+                    self.item_db.get(str(m), {}).get("title", "") for m in rel_mids
+                ]
+                rel_titles = [t for t in rel_titles if t and t != "Unknown Title"]
+                if not rel_titles:
+                    rel_titles = [str(target_title)]
+
                 context = self._make_context_text(hist_titles)
-                prompt = self._make_audit_prompt(context, g_last, a_last, o_last)
+
+                # Re-ranking formulation: the model orders a fixed candidate set
+                # instead of generating titles from the whole catalogue.  The
+                # published utility numbers correspond to this setting -- open
+                # generation over the full catalogue yields roughly an order of
+                # magnitude less Recall@10 (see REPRODUCIBILITY_NOTE.md).
+                cand_titles: List[str] = []
+                if getattr(Config, "TASK_MODE", "open") == "rerank":
+                    n_cand = int(getattr(Config, "RERANK_N_CANDIDATES", 20))
+                    pos = list(dict.fromkeys(rel_titles))[:n_cand]
+                    n_neg = max(0, n_cand - len(pos))
+                    negs: List[str] = []
+                    if n_neg:
+                        pool = self._distractor_pool()
+                        banned = set(pos) | set(hist_titles)
+                        picks = self._rng.choice(
+                            len(pool), size=min(n_neg * 3, len(pool)), replace=False
+                        )
+                        for j in picks:
+                            t = pool[int(j)]
+                            if t and t not in banned:
+                                negs.append(t)
+                            if len(negs) >= n_neg:
+                                break
+                    cand_titles = pos + negs
+                    self._rng.shuffle(cand_titles)
+
+                prompt = self._make_audit_prompt(
+                    context, g_last, a_last, o_last, candidates=cand_titles
+                )
 
                 rows.append(
                     PromptRow(
@@ -242,6 +316,8 @@ class DatasetLoader:
                         occupation=o_last,
                         target_mid=str(target_mid),
                         target_title=str(target_title),
+                        target_titles="||".join(rel_titles),
+                        candidates="||".join(cand_titles),
                     )
                 )
 

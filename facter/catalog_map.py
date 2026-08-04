@@ -48,7 +48,15 @@ def rewrite_prompt_attrs(prompt: str, new_attrs: Dict[str, str]) -> str:
     for k, v in new_attrs.items():
         pattern = rf"(\-\s*{re.escape(k)}\s*:\s*)(.*)"
         if re.search(pattern, out, flags=re.IGNORECASE):
-            out = re.sub(pattern, rf"\1{v}", out, flags=re.IGNORECASE)
+            # NB: the replacement must be a function, not an f-string template.
+            # ML-1M codes age and occupation numerically, so a template of the
+            # form rf"\1{v}" splices the value straight after the group
+            # reference -- "\1" + "18" is parsed as group 118 and re raises
+            # "invalid group reference".  That is every counterfactual flip on
+            # the two numeric protected attributes the paper evaluates.
+            out = re.sub(
+                pattern, lambda m, _v=str(v): m.group(1) + _v, out, flags=re.IGNORECASE
+            )
             replaced_any = True
 
     if replaced_any:
@@ -192,3 +200,18 @@ class CatalogMapper:
 
         valid_at_k = float(valid) / float(k) if k > 0 else 0.0
         return MapResult(mapped_titles=mapped_titles, mapped_mids=mapped_mids, sims=sims_out, valid_at_k=valid_at_k)
+
+def strip_prompt_attrs(prompt: str) -> str:
+    """Remove the protected-attribute block, yielding the *neutral* prompt.
+
+    FaiRLLM's SNSR/SNSV are defined as the spread of similarity between a
+    neutral recommendation list and the lists produced when each sensitive
+    attribute value is injected, so a genuine attribute-free prompt is required.
+    """
+    if not prompt:
+        return prompt
+    out = re.sub(r"^\s*-\s*(gender|age|occupation)\s*:.*$", "", prompt,
+                 flags=re.IGNORECASE | re.MULTILINE)
+    out = re.sub(r"User profile \(audit only\):\s*\n+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.lstrip("\n")

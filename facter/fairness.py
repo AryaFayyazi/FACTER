@@ -63,8 +63,13 @@ class ConformalFairnessValidator:
         self.cal_context_embeds: Optional[torch.Tensor] = None
 
         self.adaptive_threshold: Optional[float] = None
+        # Q^(0): the calibration threshold, frozen. Violations are reported
+        # against both this and the moving Q^(t) -- see Config.REPORT_FIXED_THRESHOLD.
+        self.fixed_threshold: Optional[float] = None
         self.violation_memory: List[ViolationRecord] = []
-        self.violation_count: int = 0
+        self.violation_count: int = 0          # against the adaptive Q^(t)
+        self.violation_count_fixed: int = 0    # against the frozen Q^(0)
+        self.n_validated: int = 0
 
     # -------------------------
     # Feature extraction (simple)
@@ -220,21 +225,96 @@ class ConformalFairnessValidator:
             )
             scores.append(s_i)
 
-        self.adaptive_threshold = self._conformal_quantile(scores, Config.ALPHA)
-        logger.info(f"Calibration complete: Q_alpha={self.adaptive_threshold:.4f} (n={len(scores)})")
+        q_raw = self._conformal_quantile(scores, Config.ALPHA)
+        # Eq. 15: Q = Quantile(1-alpha; {s_i}) + C/sqrt(n).  The paper leaves C
+        # unspecified, but Eq. 18 uses sqrt(log(2/delta)/(2n)) as its
+        # finite-sample slack, so C = sqrt(log(2/delta)/2) reproduces it exactly.
+        # Earlier code omitted the correction entirely.
+        self.correction = 0.0
+        if getattr(Config, "USE_EQ15_CORRECTION", True):
+            n = max(1, len(scores))
+            C = float(np.sqrt(np.log(2.0 / Config.CONFORMAL_DELTA) / 2.0))
+            self.correction = float(C / np.sqrt(n))
+        self.adaptive_threshold = float(q_raw + self.correction)
+        # Freeze the calibration threshold.  Everything downstream reports
+        # violations against BOTH this and the moving threshold.
+        self.fixed_threshold = float(self.adaptive_threshold)
+        logger.info(
+            f"Calibration complete: Q_alpha={self.adaptive_threshold:.4f} (n={len(scores)}) "
+            f"[frozen Q^(0)={self.fixed_threshold:.4f}]"
+        )
 
     # -------------------------
     # Online update + validation
     # -------------------------
-    def _update_threshold_on_violation(self, s_new: float) -> None:
-        """
-        Exponential update: Q <- γ Q + (1-γ) s_new
+    def _update_threshold(self, s_new: float, is_violation: bool) -> None:
+        """Advance the online threshold by the configured rule.
+
+        See ``Config.THRESHOLD_UPDATE`` for why the default is the two-sided ACI
+        update rather than the one-sided exponential rule shipped previously.
+        The short version: a violation means ``s_new > Q``, so the one-sided rule
+        only ever moves ``Q`` upward, and a violation count measured against a
+        monotonically rising bar falls whether or not the recommendations got
+        any fairer.
         """
         if self.adaptive_threshold is None:
             self.adaptive_threshold = s_new
             return
-        self.adaptive_threshold = float(
-            Config.QUANTILE_DECAY * self.adaptive_threshold + (1.0 - Config.QUANTILE_DECAY) * s_new
+
+        mode = getattr(Config, "THRESHOLD_UPDATE", "aci")
+
+        if mode == "aci":
+            # Gibbs & Candes (2021): Q_{t+1} = Q_t + eta * (alpha - 1{violation}).
+            # Tightens on a conforming step, loosens on a violation, and tracks
+            # the alpha-quantile in the long run instead of drifting.
+            eta = float(getattr(Config, "ACI_STEP", 0.05))
+            err = 1.0 if is_violation else 0.0
+            self.adaptive_threshold = float(
+                self.adaptive_threshold + eta * (err - Config.ALPHA)
+            )
+            # keep the threshold in a sane range for a bounded score
+            self.adaptive_threshold = float(max(0.0, self.adaptive_threshold))
+            return
+
+        if not is_violation:
+            return  # the legacy and Eq.11 rules only fire on violations
+
+        if mode == "paper_eq11":
+            # Exactly as printed: min(Q, s_new) == Q whenever s_new > Q, so this
+            # is a no-op on violations.  Retained so the published equation can
+            # be run and inspected.
+            self.adaptive_threshold = float(
+                Config.QUANTILE_DECAY * self.adaptive_threshold
+                + (1.0 - Config.QUANTILE_DECAY) * min(self.adaptive_threshold, s_new)
+            )
+        elif mode == "legacy":
+            self.adaptive_threshold = float(
+                Config.QUANTILE_DECAY * self.adaptive_threshold
+                + (1.0 - Config.QUANTILE_DECAY) * s_new
+            )
+        else:
+            raise ValueError(f"unknown THRESHOLD_UPDATE {mode!r}")
+
+    def score_only(
+        self,
+        context: str,
+        attrs: Dict[str, str],
+        recs: List[str],
+        y_true_title: Optional[str] = None,
+    ) -> float:
+        """Nonconformity score for a candidate output, with no side effects.
+
+        Used to score baselines against the same frozen threshold Q^(0) as
+        FACTER.  Unlike :meth:`validate` this does not touch the adaptive
+        threshold, the violation buffer, or any counter.
+        """
+        if self.adaptive_threshold is None:
+            raise RuntimeError("Validator must be calibrated before score_only().")
+        return self._score_S(
+            context=context,
+            group=_group_key(attrs),
+            y_hat_title=recs[0] if recs else "",
+            y_true_title=y_true_title,
         )
 
     def validate(
@@ -257,13 +337,43 @@ class ConformalFairnessValidator:
         s_new = self._score_S(context=context, group=group, y_hat_title=yhat_title, y_true_title=y_true_title)
 
         is_violation = bool(s_new > float(self.adaptive_threshold))
+        self.n_validated += 1
+
+        # Independent accounting against the frozen calibration threshold.  This
+        # is the number that answers "did the recommendations change?" as opposed
+        # to "did the bar move?".
+        if self.fixed_threshold is not None and s_new > float(self.fixed_threshold):
+            self.violation_count_fixed += 1
+
         if is_violation:
             self.violation_count += 1
             feats = self._extract_features(recs)
             self._store_violation(context, prompt, recs, group, s_new, float(self.adaptive_threshold), feats)
-            self._update_threshold_on_violation(s_new)
+
+        # The threshold advances on every step, not only on violations, so that
+        # it can tighten as well as loosen (see _update_threshold).
+        self._update_threshold(s_new, is_violation)
 
         return is_violation, float(s_new), float(self.adaptive_threshold)
+
+    def summary(self) -> Dict[str, float]:
+        """Violation counts under both the adaptive and the frozen threshold."""
+        n = max(1, self.n_validated)
+        return {
+            "n_validated": float(self.n_validated),
+            "violations_adaptive": float(self.violation_count),
+            "violations_fixed": float(self.violation_count_fixed),
+            "violation_rate_adaptive": self.violation_count / n,
+            "violation_rate_fixed": self.violation_count_fixed / n,
+            "Q_fixed": float(self.fixed_threshold) if self.fixed_threshold is not None else float("nan"),
+            "Q_adaptive": float(self.adaptive_threshold) if self.adaptive_threshold is not None else float("nan"),
+        }
+
+    def reset_counts(self) -> None:
+        """Zero the per-iteration counters (the threshold and buffer persist)."""
+        self.violation_count = 0
+        self.violation_count_fixed = 0
+        self.n_validated = 0
 
     def _store_violation(
         self,

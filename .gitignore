@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+logs/
+results_*.json
+*.driver
+dl.log
+.env.local

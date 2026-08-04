@@ -28,16 +28,26 @@ def setup_logging():
 # Prompt formatting (chat template if available)
 # -------------------------
 def _format_chat(tokenizer, system_msg: str, user_msg: str) -> torch.Tensor:
+    """Render one chat turn to a 1-D LongTensor of prompt token ids.
+
+    ``apply_chat_template`` returns a plain tensor on some transformers versions
+    and a BatchEncoding on others; normalise both to a tensor here so callers
+    can rely on ``.shape``.
+    """
     messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
-    # fallback
+        enc = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        )
+        if not isinstance(enc, torch.Tensor):
+            enc = enc["input_ids"]
+        return enc.reshape(-1)
     text = f"<system>\n{system_msg}\n</system>\n<user>\n{user_msg}\n</user>\n<assistant>\n"
-    return tokenizer(text, return_tensors="pt").input_ids
+    return tokenizer(text, return_tensors="pt").input_ids.reshape(-1)
 
 
-def _best_fuzzy_match(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+# (an earlier duplicate of _best_fuzzy_match lived here, shadowed by the
+# None-safe definition below; removed)
 
 
 def parse_ranked_list(text: str, k: int) -> List[str]:
@@ -92,7 +102,32 @@ def generate_recommendations(
     tokenizer,
     model,
 ) -> List[List[str]]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    """Batched Top-K generation.
+
+    Three correctness requirements this path has to meet, all of which are easy
+    to get wrong and all of which silently corrupt every downstream metric:
+
+    1. **Decode only the completion.**  ``batch_decode`` over the full output
+       tensor returns prompt + completion, and the prompt embeds the user's
+       watch history as a numbered list -- exactly the format
+       :func:`parse_ranked_list` looks for.  Parsing the full text therefore
+       returns the user's *own history* as the recommendation list, for every
+       method.  Because a counterfactual prompt differs from its base only in a
+       few attribute words, the two echoed lists are near-identical and CFR
+       collapses toward zero regardless of the method under test.  We slice off
+       the prompt before decoding.
+
+    2. **Pass an attention mask.**  Padding is applied on the left, so without a
+       mask the model attends to pad tokens as if they were context.
+
+    3. **Have a pad token.**  Llama-3 ships no pad token; fall back to EOS.
+    """
+    device = next(model.parameters()).device
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+        tokenizer.pad_token = tokenizer.eos_token
+
     all_recs: List[List[str]] = []
 
     for i in range(0, len(prompts), Config.BATCH_SIZE):
@@ -100,33 +135,36 @@ def generate_recommendations(
         if not batch:
             continue
 
-        # build batch input ids
-        input_ids_list = [_format_chat(tokenizer, system_msg, p) for p in batch]
-        # pad manually
-        max_len = max(x.shape[-1] for x in input_ids_list)
-        input_ids = torch.full((len(input_ids_list), max_len), tokenizer.pad_token_id, dtype=torch.long)
-        for j, x in enumerate(input_ids_list):
-            input_ids[j, -x.shape[-1] :] = x[0]
+        ids_list = [_format_chat(tokenizer, system_msg, p) for p in batch]
+        ids_list = [x[-Config.MAX_PROMPT_LENGTH :] for x in ids_list]
+        max_len = max(x.shape[-1] for x in ids_list)
+
+        input_ids = torch.full((len(ids_list), max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(ids_list), max_len), dtype=torch.long)
+        for j, x in enumerate(ids_list):  # left-pad
+            input_ids[j, -x.shape[-1] :] = x
+            attention_mask[j, -x.shape[-1] :] = 1
         input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
 
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=Config.MAX_NEW_TOKENS,
                 temperature=Config.TEMPERATURE,
                 top_p=Config.TOP_P,
                 repetition_penalty=Config.REPETITION_PENALTY,
                 do_sample=True,
+                pad_token_id=pad_id,
             )
 
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        for txt in decoded:
-            recs = parse_ranked_list(txt, Config.TOP_K_RECS)
-            all_recs.append(recs)
+        # completion only -- see requirement (1) above
+        completions = outputs[:, input_ids.shape[1] :]
+        for txt in tokenizer.batch_decode(completions, skip_special_tokens=True):
+            all_recs.append(parse_ranked_list(txt, Config.TOP_K_RECS))
 
-    # if any prompts were None, keep alignment by returning empty lists for them
     if len(all_recs) != len(prompts):
-        # best-effort: pad
         while len(all_recs) < len(prompts):
             all_recs.append([])
         all_recs = all_recs[: len(prompts)]
@@ -136,15 +174,8 @@ def generate_recommendations(
 # -------------------------
 # Metrics (@K)
 # -------------------------
-def hitrate_ndcg_at_k(preds: List[str], gold: str, k: int) -> Tuple[float, float]:
-    if not preds:
-        return 0.0, 0.0
-    gold = gold.strip()
-    for rank, p in enumerate(preds[:k], start=1):
-        if _best_fuzzy_match(p, gold) >= 0.85:
-            # Hit@K = 1; NDCG@K = 1/log2(rank+1)
-            return 1.0, 1.0 / np.log2(rank + 1)
-    return 0.0, 0.0
+# (an earlier duplicate of hitrate_ndcg_at_k lived here and was silently
+# shadowed by the definition below; removed)
 
 
 def evaluate_at_k(df, k: int = 10) -> dict:
@@ -174,20 +205,72 @@ def hitrate_ndcg_at_k(preds: List[str], gold: str, k: int) -> Tuple[float, float
     return 0.0, 0.0
 
 
+def _as_gold_list(gold) -> List[str]:
+    """Accept a single title, a list, or a '||'-joined relevance set."""
+    if isinstance(gold, (list, tuple)):
+        return [str(g).strip() for g in gold if str(g).strip()]
+    g = str(gold or "").strip()
+    if not g:
+        return []
+    return [t.strip() for t in g.split("||") if t.strip()]
+
+
+def recall_ndcg_at_k(preds: List[str], gold, k: int) -> Tuple[float, float, float]:
+    """Multi-target Recall@k, NDCG@k and HitRate@k under binary relevance.
+
+    Recall@k = |R_rel ∩ R_k| / |R_rel|
+    NDCG@k   = DCG@k / IDCG@k with gain 1 for a relevant item
+
+    With a single target this reduces to the usual next-item metrics, where
+    Recall@k == HitRate@k and NDCG@k <= Recall@k.  A published table showing
+    NDCG@k > Recall@k therefore implies |R_rel| > 1, which is why the relevance
+    window is now an explicit, configurable part of the protocol
+    (Config.RELEVANCE_WINDOW) rather than an unstated choice.
+    """
+    golds = _as_gold_list(gold)
+    if not preds or not golds:
+        return 0.0, 0.0, 0.0, 0.0
+
+    matched, hit = set(), 0.0
+    dcg = 0.0
+    for rank, p in enumerate(preds[:k], start=1):
+        if not p:
+            continue
+        for gi, g in enumerate(golds):
+            if gi in matched:
+                continue
+            if _best_fuzzy_match(p, g) >= 0.85:
+                matched.add(gi)
+                dcg += 1.0 / np.log2(rank + 1)
+                hit = 1.0
+                break
+
+    ideal = min(len(golds), k)
+    idcg = sum(1.0 / np.log2(r + 1) for r in range(1, ideal + 1))
+    recall = len(matched) / len(golds)
+    ndcg = (dcg / idcg) if idcg > 0 else 0.0
+    # Precision@k is reported alongside because the published tables' "NDCG@10"
+    # column matches this quantity, not NDCG (see REPRODUCIBILITY_NOTE.md §5).
+    precision = len(matched) / float(k)
+    return float(recall), float(ndcg), float(hit), float(precision)
+
+
 def evaluate_at_k_from_lists(
     rec_lists: List[List[str]],
-    gold_titles: List[str],
+    gold_titles: List,
     k: int = 10,
 ) -> Dict[str, float]:
-    hits, ndcgs = [], []
+    """Recall@k / NDCG@k / HitRate@k. ``gold_titles`` may be single or multi-target."""
+    recalls, ndcgs, hits, precs = [], [], [], []
     for recs, gold in zip(rec_lists, gold_titles):
         recs = recs if isinstance(recs, list) else []
-        h, n = hitrate_ndcg_at_k(recs, str(gold), k)
-        hits.append(h)
-        ndcgs.append(n)
+        r, n, h, pr = recall_ndcg_at_k(recs, gold, k)
+        recalls.append(r); ndcgs.append(n); hits.append(h); precs.append(pr)
     return {
-        f"HitRate@{k}": float(np.mean(hits)) if hits else 0.0,
+        f"Recall@{k}": float(np.mean(recalls)) if recalls else 0.0,
         f"NDCG@{k}": float(np.mean(ndcgs)) if ndcgs else 0.0,
+        f"HitRate@{k}": float(np.mean(hits)) if hits else 0.0,
+        f"Precision@{k}": float(np.mean(precs)) if precs else 0.0,
     }
 
 

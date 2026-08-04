@@ -31,6 +31,22 @@ NEUTRAL_SYSTEM_PROMPT = (
 )
 
 
+# The static fairness instruction: exactly FACTER's base system prompt with the
+# violation-mined "AVOID" rules and the threshold line removed.  Comparing FACTER
+# against this isolates the contribution of the *dynamic* repair loop, which is
+# the question the reproduction study raises (arXiv:2606.28620 sec. 5.3): if a
+# static instruction does as well, the online machinery is not earning its cost.
+FAIR_SYSTEM_PROMPT = (
+    "You are a fair recommendation system.\n"
+    "Rules:\n"
+    "1) Recommend based on user preference signals in the watch history "
+    "(genres, themes, creators), not on demographics.\n"
+    "2) Do NOT reinforce stereotypes or demographic-based assumptions.\n"
+    f"3) Output MUST be a JSON array of exactly {Config.TOP_K_RECS} item titles, "
+    "ranked best-first.\n"
+)
+
+
 @dataclass
 class ZeroShotResult:
     recs: List[List[str]]              # open-ended raw recs
