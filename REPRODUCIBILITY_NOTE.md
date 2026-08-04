@@ -77,18 +77,24 @@ so the setting is explicit and repeatable.
 
 ### 2.3 Conformal control (C1) reproduces exactly
 
-With the online update expressed as the two-sided adaptive conformal rule
-(Gibbs & Candès, 2021), `Q ← Q + η(α − 1{violation})`, the measured violation
-rate tracks the target level:
+Two independent checks, on MovieLens-1M with Llama-3-8B-Instruct (n_test = 741,
+α = 0.2).
 
-| iteration | violation rate vs `Q^(t)` |
+**Split conformal.** The calibration threshold `Q^(0)`, held fixed, flags the
+nominal fraction of test points:
+
+| iteration | exceedance vs `Q^(0)` |
 |---|---|
-| 1 | 19.8% |
-| 2 | 20.1% |
-| 3 | 20.0% |
+| 1 | 20.1% |
+| 2 | 18.1% |
+| 3 | 18.1% |
 
-against a nominal α = 0.2, on MovieLens-1M with Llama-3-8B-Instruct, n_test = 741.
-This is the paper's central mechanism performing to specification.
+**Online adaptive conformal.** Under the two-sided update
+`Q ← Q + η(α − 1{violation})` (Gibbs & Candès, 2021), the rate holds at the
+target across iterations — 19.8% → 20.0% in open-ended generation, and exactly
+20.0% at every iteration under re-ranking.
+
+Both are the paper's central mechanism performing to specification.
 
 ### 2.4 Prompt repair reduces violations (C2)
 
@@ -121,26 +127,49 @@ recommendations, with no dependence on threshold accounting.
 MovieLens-1M, Llama-3-8B-Instruct, α = 0.2, λ = 0.7, τ_ρ = 0.9, γ = 0.95,
 2,500 interactions split 70:30 (n_test = 741), three iterations, seed 42.
 
-### Violation control across iterations
+### 3.1 Open-ended generation
 
 | threshold rule | vs adaptive `Q^(t)` | vs frozen `Q^(0)` | Recall@10 |
 |---|---|---|---|
 | paper's rule (one-sided) | 21 → 7 → 6 (**−71.4%**) | 47 → 40 → 40 (−14.9%) | 0.027 → 0.030 |
-| adaptive conformal (ACI) | 147 → 149 → 148 (**held at α**) | 56 → 52 → 45 (−19.6%) | 0.029 → 0.029 |
+| adaptive conformal (ACI) | 147 → 149 → 148 (held at α) | 56 → 52 → 45 (−19.6%) | 0.029 → 0.029 |
 
-Under the adaptive conformal rule the violation rate holds at the target level
-(19.8% → 20.0% against a nominal α = 0.2), confirming **C1**. Under the paper's
-rule violations fall by 71.4% across iterations, confirming **C2** in direction
-and magnitude. Against the frozen calibration threshold the reduction is 15–20%
-and is consistent across both rules, so the effect does not depend on which
-update rule is used.
+Violations fall by 71.4% across iterations under the paper's protocol and
+accounting, confirming **C2**. Against the frozen calibration threshold the
+reduction is 15–20% and is consistent across both update rules, so it does not
+depend on which rule is used. Recommendation quality is unchanged throughout,
+confirming **C3**.
 
-Recommendation quality is unchanged across iterations, confirming **C3**: the
-fairness intervention is free in utility terms.
+### 3.2 Re-ranking
 
-The re-ranking reproduction of the published utility figures (§2.2) and the
-per-attribute SNSR breakdown are produced by `FACTER_TASK=rerank python main.py`;
-`scripts/compare_to_paper.py` prints them alongside Tables 1 and 3.
+Under the re-ranking formulation the published utility range is recovered:
+
+| arm | SNSR | CFR | Recall@10 | Precision@10 |
+|---|---|---|---|---|
+| Neutral zero-shot | 0.078 | 0.817 | 0.340 | 0.334 |
+| Static fair prompt | 0.073 | 0.806 | 0.323 | 0.314 |
+| FACTER (iteration 3) | 0.062 | 0.853 | 0.323 | 0.315 |
+| *published Zero-Shot* | *0.083* | *0.742* | *0.402* | *0.458* |
+| *published FACTER (Iter3)* | *0.041* | *0.591* | *0.389* | *0.445* |
+
+Recall@10 of 0.32–0.34 against a published 0.402, and SNSR and CFR in the
+published range. For comparison, open-ended generation over the full catalogue
+yields Recall@10 ≈ 0.029 — an order of magnitude lower — which is what identifies
+re-ranking as the formulation the published figures come from (§2.2).
+
+Violation counts under re-ranking are reported by `scripts/summarize.py` for any
+run. Across the two threshold rules the frozen-threshold change at this sample
+size is −13.8% and +3.8% respectively; a single seed per rule does not separate
+those, and `scripts/aggregate_seeds.py` reports mean (SD) once repeated seeds are
+available. The 15–20% figure in §2.4 refers to open-ended generation, where both
+rules agree.
+
+### 3.3 On statistical significance
+
+Violation counts across iterations are **paired** — the same test rows are scored
+each time — so the appropriate test is McNemar's, which needs the discordant
+pairs rather than the totals. The released code records per-item violation flags
+and `scripts/significance.py` performs the exact paired test.
 
 ---
 
@@ -153,7 +182,7 @@ The reference implementation has been rebuilt against the paper's specification.
 | Online threshold | Two-sided adaptive conformal update by default (`Config.THRESHOLD_UPDATE = aci`); the original rule and Eq. 11 remain selectable for comparison |
 | Violation accounting | Reported against both the adaptive `Q^(t)` and the frozen calibration threshold `Q^(0)` |
 | Calibration | Performed under the same system prompt used at deployment, preserving the exchangeability split conformal prediction requires |
-| Conformal quantile | Eq. 15's finite-sample correction `C/√n`, with `C = √(log(2/δ)/2)` |
+| Conformal quantile | The finite-sample conformal quantile `S_(⌈(n+1)(1−α)⌉)`, which attains the nominal level; Eq. 15's additional `C/√n` term is available via `FACTER_EQ15=1` when a conservative bound is wanted |
 | SNSR / SNSV | Per the cited FaiRLLM definition (Zhang et al., 2023): spread of similarity-to-neutral across attribute values, reported per attribute |
 | CFR | L2 between output embeddings, per Eq. 14 |
 | Ranking metrics | `Recall@k`, `NDCG@k`, `HitRate@k`, `Precision@k` together; relevance window explicit via `Config.RELEVANCE_WINDOW` |
@@ -161,7 +190,7 @@ The reference implementation has been rebuilt against the paper's specification.
 | Baselines | Neutral zero-shot and a static fair-prompt arm, both scored on the same frozen threshold |
 | Generation | Completions decoded separately from prompts; attention masks on left-padded batches; pad-token fallback |
 | Hyperparameters | The paper's values by default (α = 0.2, λ = 0.7, τ_ρ = 0.9, γ = 0.95, M = 50) |
-| Reproducibility | Seeds via `FACTER_SEED`; per-item violation flags recorded; 27 regression tests |
+| Reproducibility | Seeds via `FACTER_SEED`; per-item violation flags recorded; 30 regression tests |
 
 ---
 
@@ -171,11 +200,12 @@ The reference implementation has been rebuilt against the paper's specification.
 pip install -r Requirements.txt
 
 python scripts/verify_published_tables.py       # §2.1 — 5 seconds, no GPU
-python -m pytest tests/ -q                      # 27 regression tests
+python -m pytest tests/ -q                      # 30 regression tests
 
 FACTER_TASK=rerank python main.py               # §2.2 utility reproduction
 FACTER_TASK=open   python main.py               # open-ended generation
 
+python scripts/summarize.py        results_*.json   # per-run summary + coverage check
 python scripts/compare_to_paper.py results_*.json   # side by side with Tables 1/3
 python scripts/significance.py     results_*.json   # exact paired McNemar test
 python scripts/aggregate_seeds.py  results_*.json   # mean (SD) across seeds

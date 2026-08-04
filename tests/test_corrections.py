@@ -280,3 +280,35 @@ def test_main_evaluates_the_fair_arm_on_the_same_frozen_threshold():
 
 def test_seed_is_configurable_for_multi_seed_runs():
     assert isinstance(Config.RANDOM_SEED, int)
+
+
+# --------------------------------------------------------------------------
+# D18: calibration and test scores must be computed on the same representation.
+# --------------------------------------------------------------------------
+def test_calibration_scores_use_catalog_mapped_titles():
+    """validate() scores mapped titles, so calibrate() must too."""
+    src = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+    assert "cal_recs_raw" in code, "raw generations must be mapped before calibration"
+    i = code.index("cal_recs = [")
+    assert "mapper.map_list" in code[i:i + 200]
+
+
+# --------------------------------------------------------------------------
+# D19: the conformal threshold must hit its nominal level, not over-cover.
+# --------------------------------------------------------------------------
+def test_eq15_correction_is_off_by_default():
+    """C/sqrt(n) with Eq.18's constant over-covers: 7.8% observed at alpha=0.2."""
+    assert Config.USE_EQ15_CORRECTION is False
+
+
+def test_plain_conformal_quantile_hits_the_nominal_level():
+    """S_(ceil((n+1)(1-alpha))) should flag ~alpha of exchangeable test points."""
+    rng = np.random.default_rng(11)
+    cal = rng.gamma(2.0, 0.45, size=4000)
+    test = rng.gamma(2.0, 0.45, size=4000)
+    alpha = 0.2
+    k = int(np.ceil((len(cal) + 1) * (1 - alpha)))
+    q = np.sort(cal)[k - 1]
+    rate = float((test > q).mean())
+    assert abs(rate - alpha) < 0.02, f"exceedance {rate:.3f} vs nominal {alpha}"

@@ -118,8 +118,14 @@ class Config:
     RELEVANCE_WINDOW: int = int(_os.environ.get("FACTER_RELEVANCE_WINDOW", 10))
     # Eq. 14 states an L2 norm between output embeddings.
     CFR_DISTANCE: str = _os.environ.get("FACTER_CFR_DISTANCE", "l2")
-    # Eq. 15 adds a finite-sample correction C/sqrt(n) to the conformal quantile.
-    USE_EQ15_CORRECTION: bool = _os.environ.get("FACTER_EQ15", "1") == "1"
+    # Eq. 15 writes Q = Quantile(1-alpha) + C/sqrt(n).  Instantiating C with the
+    # constant from Eq. 18, sqrt(log(2/delta)/2), turns Q into a conservative
+    # high-probability UPPER BOUND on the quantile rather than the operating
+    # threshold: measured exceedance drops to 7.8% at a nominal alpha of 0.2.
+    # The plain finite-sample conformal quantile S_(ceil((n+1)(1-alpha))) is
+    # already valid and reproduces alpha exactly (measured: 20.1%), so it is the
+    # default.  Enable this only if the conservative bound is wanted.
+    USE_EQ15_CORRECTION: bool = _os.environ.get("FACTER_EQ15", "0") == "1"
     CONFORMAL_DELTA: float = 0.05          # delta in Eq. 18 -> C = sqrt(log(2/delta)/2)
     # SNSR/SNSV per FaiRLLM (Zhang et al., 2023): similarity-to-neutral spread.
     SNSR_N_USERS: int = int(_os.environ.get("FACTER_SNSR_USERS", 40))

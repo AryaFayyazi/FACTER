@@ -105,10 +105,20 @@ def main():
             "" if getattr(Config, "CALIBRATION_PROMPT", "neutral") == "empty"
             else NEUTRAL_SYSTEM_PROMPT
         )
-        cal_recs = generate_recommendations(
+        cal_recs_raw = generate_recommendations(
             train_df["prompt"].tolist(), system_msg=cal_system_msg,
             tokenizer=tokenizer, model=model,
         )
+        # Score calibration on catalogue-mapped titles, exactly as validate()
+        # does at test time.  Scoring calibration on raw generations and test on
+        # mapped titles compares two different quantities: mapped titles are
+        # canonical catalogue strings and match the target far more closely, so
+        # the calibration scores sit systematically higher and Q^(0) comes out
+        # far too permissive (observed: 1.6% violations at a nominal alpha=0.2).
+        cal_recs = [
+            mapper.map_list(r, k=Config.TOP_K_RECS, min_sim=0.65).mapped_titles
+            for r in cal_recs_raw
+        ]
 
         cal_groups = [
             _group_key({k: str(row[k]) for k in Config.PROTECTED_ATTRIBUTES})

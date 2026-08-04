@@ -236,6 +236,17 @@ class ConformalFairnessValidator:
             C = float(np.sqrt(np.log(2.0 / Config.CONFORMAL_DELTA) / 2.0))
             self.correction = float(C / np.sqrt(n))
         self.adaptive_threshold = float(q_raw + self.correction)
+
+        # Keep the calibration score distribution so the exchangeability
+        # assumption can be checked directly against the test scores rather
+        # than inferred from the violation count.
+        qs = [1, 5, 10, 25, 50, 75, 80, 90, 95, 99]
+        self.cal_score_quantiles = {
+            f"p{q}": float(np.percentile(scores, q)) for q in qs
+        }
+        self.cal_score_mean = float(np.mean(scores))
+        self.cal_score_std = float(np.std(scores))
+        self.cal_n = int(len(scores))
         # Freeze the calibration threshold.  Everything downstream reports
         # violations against BOTH this and the moving threshold.
         self.fixed_threshold = float(self.adaptive_threshold)
@@ -366,6 +377,9 @@ class ConformalFairnessValidator:
             "violation_rate_adaptive": self.violation_count / n,
             "violation_rate_fixed": self.violation_count_fixed / n,
             "Q_fixed": float(self.fixed_threshold) if self.fixed_threshold is not None else float("nan"),
+            "cal_score_quantiles": getattr(self, "cal_score_quantiles", None),
+            "cal_score_mean": getattr(self, "cal_score_mean", None),
+            "cal_score_std": getattr(self, "cal_score_std", None),
             "Q_adaptive": float(self.adaptive_threshold) if self.adaptive_threshold is not None else float("nan"),
         }
 
