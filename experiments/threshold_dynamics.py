@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Is the violation reduction a property of the outputs, or of the threshold?
+"""Characterise the online threshold-update rules, model-free.
 
-This is a controlled, model-free check of the online threshold rule.  Scores are
-drawn i.i.d. from a **fixed** distribution across all iterations, so by
-construction the recommendations never improve.  Any drop in the violation count
-is therefore attributable to the threshold rule alone.
+Scores are drawn i.i.d. from a fixed distribution across all iterations, which
+isolates the behaviour of the update rule itself from any change in the
+underlying recommendations.  Violations are counted twice: against the adaptive
+threshold Q^(t) and against the frozen calibration threshold Q^(0).
+
+Three rules are compared:
+  aci         two-sided adaptive conformal update (the default)
+  legacy      one-sided exponential update, applied on violations
+  paper_eq11  Eq. 11 as printed
 
 Run:  python experiments/threshold_dynamics.py
 """
@@ -86,10 +91,11 @@ def main() -> int:
         drop = 100.0 * (1 - per_iter[-1][0] / max(1, per_iter[0][0]))
         print(f"{'':<12}{'':>5}{'reduction vs Q^(t): ' + format(drop, '.1f') + '%':>30}\n")
 
-    print("Reading: under `legacy` the adaptive count collapses while the fixed-threshold")
-    print("count stays flat -- the outputs are unchanged by construction, so that entire")
-    print("reduction is threshold movement. `paper_eq11` is an exact no-op on violations.")
-    print("`aci` holds the violation rate near alpha, which is the intended behaviour.")
+    print("Summary. `aci` holds the violation rate near alpha across iterations, which")
+    print("is the intended behaviour and the basis of the coverage guarantee. `legacy`")
+    print("moves Q upward on each violation, so counts against Q^(t) fall while counts")
+    print("against the frozen Q^(0) are unchanged. `paper_eq11` leaves Q unchanged, since")
+    print("min(Q, S) = Q whenever S > Q. Report both columns to separate the two effects.")
     return 0
 
 
