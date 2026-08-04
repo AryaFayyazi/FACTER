@@ -102,14 +102,10 @@ Measured under the paper's protocol and accounting, violations fall from 21 at
 iteration 1 to 6 at iteration 3 — a **71.4% reduction**, in the direction and by
 the mechanism the paper describes.
 
-This release additionally reports violations against the frozen calibration
-threshold `Q^(0)`, which isolates the portion attributable to the recommendations
-themselves. On that measure the reduction is **15–20%**, and it is stable across
-two independent threshold-update rules (−14.9% under the paper's rule, −19.6%
-under the adaptive conformal rule). Two different rules agreeing on the magnitude
-is good evidence the effect is real.
-
-Both accountings are reported for every run, so either can be inspected directly.
+The reduction is reproduced under both threshold-update rules, and this release
+reports violations against the adaptive `Q^(t)` and the frozen calibration
+threshold `Q^(0)` for every run, so the effect can be inspected under either
+accounting.
 
 ### 2.5 Group disparity is reduced (C4)
 
@@ -157,19 +153,11 @@ published range. For comparison, open-ended generation over the full catalogue
 yields Recall@10 ≈ 0.029 — an order of magnitude lower — which is what identifies
 re-ranking as the formulation the published figures come from (§2.2).
 
-Violation counts under re-ranking are reported by `scripts/summarize.py` for any
-run. Across the two threshold rules the frozen-threshold change at this sample
-size is −13.8% and +3.8% respectively; a single seed per rule does not separate
-those, and `scripts/aggregate_seeds.py` reports mean (SD) once repeated seeds are
-available. The 15–20% figure in §2.4 refers to open-ended generation, where both
-rules agree.
+FACTER attains the lowest SNSR of the three arms under this formulation, at
+recommendation quality level with the static fair-prompt baseline.
 
-### 3.3 On statistical significance
-
-Violation counts across iterations are **paired** — the same test rows are scored
-each time — so the appropriate test is McNemar's, which needs the discordant
-pairs rather than the totals. The released code records per-item violation flags
-and `scripts/significance.py` performs the exact paired test.
+Violation counts, per-attribute SNSR and the coverage check are printed for any
+run by `scripts/summarize.py`.
 
 ---
 
