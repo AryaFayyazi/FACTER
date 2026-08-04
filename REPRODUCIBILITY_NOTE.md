@@ -10,7 +10,7 @@ Fairness via Conformal Thresholding and Prompt Repair*, University of Amsterdam 
 This release accompanies a full re-derivation of the paper's results. Every
 published number was re-computed from the original artefacts and re-run on
 current hardware. This note states the paper's claims, what reproduces, and how
-to verify each one yourself for comprehensiveness.
+to verify each one.
 
 ---
 
